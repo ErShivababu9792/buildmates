@@ -1,0 +1,27 @@
+{
+  "name": "buildmates",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "BuildMates \u2013 find the teammate your idea is missing",
+  "scripts": {
+    "predev": "node scripts/export-i18n.mjs",
+    "dev": "vite",
+    "prebuild": "node scripts/export-i18n.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "i18n:export": "node scripts/export-i18n.mjs",
+    "deploy:rules": "firebase deploy --only firestore:rules,firestore:indexes"
+  },
+  "dependencies": {
+    "firebase": "11.0.2",
+    "leaflet": "1.9.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-router-dom": "6.28.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "4.3.4",
+    "vite": "5.4.11"
+  }
+}

@@ -1,0 +1,1052 @@
+rules_version = '2';
+
+// BuildMates security rules (Phase 2)
+// - users/{uid}        private account data (birthday, parent email). Owner + admins only.
+// - profiles/{uid}     public profile. Readable only by approved users of the SAME age group (minors never see adults).
+// - requests/{from_to} connection requests.
+// - chats/{a_b}        a chat opens only after a request is accepted. Members only.
+//   chats/{a_b}/messages  no phone numbers in the first 7 days, nothing if either person blocked the other.
+// - blocks/{by_target} blocks. Both people are hidden from each other everywhere.
+// - reports/{id}       user reports. Only admins can read.
+// - guardEvents/{id}   messages stopped by the AI Guard (for admin stats).
+// - ideas/{id}         idea pitch (everyone in the same age group) - ideaDetails/{id} summary (connected people) - ideaPlans/{id} plan (team)
+// - teams/{id} (+ tasks, messages, exits) members only - teamInvites/{team_uid} - meets/{id} Safe Meet, adults only
+// - products/{id} (+ help, feedback, offers) Launchpad - proRequests/{uid} professional verification
+// - ratings/{by_target} pilot match ratings - feedback/{uid} pilot survey
+// - idRequests/{uid}   college ID checks (written only by the server; owner + admins can read)
+// - locations/{uid}   exact GPS point for safety: the student and admins only (others see ~1 km area)
+// - chats/{id}/trail/{uid}, circles/{id}/trail/{uid}  digits sent in the last hour (stops split phone numbers)
+// - pushTokens/{uid}   this person's devices for phone notifications (owner only; the server reads them)
+// - events/{id} (+ people/{uid}) hackathons and events; who is going / looking for a team (same age group only)
+// - roles/{id}, circles/{id} (+ sessions, messages), showcase/{teamId}  Phase 12
+// - officeHours/{id} (+ private/join, questions) mentor group sessions, 18+ - settings/{uid} weekly email choice
+// - resumes/{uid}     the student's private resume (owner only)
+// - ageLocks/{uid}    first birthday per login; can't be changed or deleted (stops age-group switching)
+// - admins/{uid}       list of admins. Managed only from the Firebase console.
+// - adminLog/{id}      record of every admin action. Nobody can edit or delete it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function isOwner(uid) { return signedIn() && me() == uid; }
+    // ---------- Split phone numbers ----------
+    // A message's digits are added to the sender's trail in the same batch. The trail restarts only when
+    // an hour has passed since the last message with digits, it can only grow, and it must stay under 10.
+    function digitsOf(t) { return t.replace('[^0-9]', ''); }
+    function trailBase(p) {
+      return exists(p) && request.time < get(p).data.at + duration.value(60, 'm') ? get(p).data.digits : '';
+    }
+    function trailOk(p, text) {
+      return digitsOf(text).size() == 0
+        || (existsAfter(p)
+            && getAfter(p).data.digits == trailBase(p) + digitsOf(text)
+            && getAfter(p).data.at == request.time);
+    }
+    function trailWriteOk(p) {
+      return request.resource.data.keys().hasOnly(['digits', 'at'])
+        && request.resource.data.digits is string
+        && request.resource.data.digits.size() < 10
+        && request.resource.data.digits.matches(trailBase(p) + '[0-9]+')
+        && request.resource.data.at == request.time;
+    }
+
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(me())); }
+    function myAccount() { return get(/databases/$(database)/documents/users/$(me())).data; }
+    function profileOf(uid) { return get(/databases/$(database)/documents/profiles/$(uid)).data; }
+    function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function isActive(p) { return p.get('status', 'active') == 'active'; }
+    function blockedEitherWay(a, b) {
+      return exists(/databases/$(database)/documents/blocks/$(a + '_' + b))
+          || exists(/databases/$(database)/documents/blocks/$(b + '_' + a));
+    }
+    // Approved (parent consent if minor), active, and same age group as the other person, and no block between them.
+    function canInteractWith(other) {
+      return signedIn()
+        && myAccount().parentConsent == true
+        && isActive(profileOf(me()))
+        && exists(/databases/$(database)/documents/profiles/$(other))
+        && profileOf(other).minor == myAccount().minor
+        && isActive(profileOf(other))
+        && !blockedEitherWay(me(), other);
+    }
+
+    // 18 years ~ 6574-6575 days depending on leap years; allow a 1-day window around the birthday.
+    function minorFlagMatches(d) {
+      return (d.minor == false && request.time >= d.dob + duration.value(6573, 'd'))
+          || (d.minor == true  && request.time <  d.dob + duration.value(6576, 'd'));
+    }
+    function atLeast13(d) { return d.dob <= request.time - duration.value(4746, 'd'); }
+    function looksLikeEmail(s) { return s is string && s.size() <= 254 && s.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$'); }
+
+    // ---------- age lock ----------
+    // The birthday a login first signed up with. It can never be changed or deleted, so deleting and
+    // re-creating the account can't move someone from Safe Mode (under 18) into the adult side or back.
+    function ageLockPath(uid) { return /databases/$(database)/documents/ageLocks/$(uid); }
+    match /ageLocks/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['dob', 'at'])
+        && request.resource.data.dob is timestamp
+        && request.resource.data.at == request.time
+        && existsAfter(/databases/$(database)/documents/users/$(uid))
+        && request.resource.data.dob == getAfter(/databases/$(database)/documents/users/$(uid)).data.dob;
+      allow update, delete: if false;
+    }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['email', 'dob', 'minor', 'parentEmail', 'parentConsent', 'consentAt', 'createdAt', 'onboarded'])
+        && request.resource.data.dob is timestamp
+        // same birthday as the first sign-up with this login (and the lock is written in the same batch)
+        && existsAfter(ageLockPath(uid))
+        && getAfter(ageLockPath(uid)).data.dob == request.resource.data.dob
+        && !exists(/databases/$(database)/documents/profiles/$(uid))
+        && atLeast13(request.resource.data)
+        && minorFlagMatches(request.resource.data)
+        && request.resource.data.parentConsent == !request.resource.data.minor   // minors start unapproved
+        && request.resource.data.onboarded == true
+        && request.resource.data.email == request.auth.token.get('email', '')
+        && (request.resource.data.minor == false || looksLikeEmail(request.resource.data.parentEmail))
+        && request.resource.data.parentEmail.lower() != request.auth.token.get('email', '').lower();   // not your own email
+
+      // Birthday, age group and consent can't be changed by the user. Only admins record parent approval.
+      allow update: if isAdmin() && onlyChanges(['parentConsent', 'parentConsentAt', 'parentConsentBy']);
+      // only when deleting the whole account (the profile is removed first)
+      allow delete: if isOwner(uid) && !exists(/databases/$(database)/documents/profiles/$(uid));
+    }
+
+    // ---------- profiles ----------
+    match /profiles/{uid} {
+      function profileKeys() {
+        return ['name', 'college', 'area', 'role', 'skills', 'interests', 'vision', 'minor', 'verified',
+                'visibility', 'b5', 'teamType', 'status', 'warnings', 'vec', 'vecFor', 'pro', 'proCompany', 'photo', 'state', 'city', 'pincode', 'geo', 'createdAt', 'updatedAt'];
+      }
+      function validProfile(d) {
+        return d.keys().hasOnly(profileKeys())
+          && d.name is string && d.name.size() >= 2 && d.name.size() <= 50
+          && d.college is string && d.college.size() <= 80
+          && d.area is string && d.area.size() <= 60
+          // Location from India Post / OpenStreetMap. Only an area centre rounded to ~1 km, never an exact position.
+          && (!('state' in d) || (d.state is string && d.state.size() <= 60))
+          && (!('city' in d) || (d.city is string && d.city.size() <= 60))
+          && (!('pincode' in d) || d.pincode == '' || (d.pincode is string && d.pincode.matches('^[1-9][0-9]{5}$')))
+          && (!('geo' in d) || d.geo == null
+              || (d.geo is map && d.geo.keys().hasOnly(['lat', 'lng']) && d.geo.lat is number && d.geo.lng is number
+                  && d.geo.lat >= -90 && d.geo.lat <= 90 && d.geo.lng >= -180 && d.geo.lng <= 180))
+          && d.role in ['Idea person', 'Builder', 'Both']
+          && d.skills is list && d.skills.size() <= 4
+          && d.interests is list && d.interests.size() <= 4
+          && d.vision is string && d.vision.size() <= 500
+          && d.visibility in ['college', 'area', 'city']
+          && (d.b5 == null || (d.b5 is list && d.b5.size() == 5))
+          && d.teamType is string && d.teamType.size() <= 40
+          && (!('vec' in d) || d.vec == null || (d.vec is list && d.vec.size() == 384))   // AI vector for matching
+          && (!('vecFor' in d) || (d.vecFor is string && d.vecFor.size() <= 20))
+          // Profile photo: only adults, only an image we uploaded to Cloudinary (or '' = removed)
+          && (!('photo' in d) || d.photo == ''
+              || (d.minor == false && d.photo is string && d.photo.size() <= 300
+                  && d.photo.matches('^https://res[.]cloudinary[.]com/[A-Za-z0-9_-]+/image/upload/.+')));
+      }
+      function approvedSameGroup() {
+        return signedIn()
+          && exists(/databases/$(database)/documents/users/$(me()))
+          && myAccount().parentConsent == true
+          && myAccount().minor == resource.data.minor;
+      }
+
+      allow read: if isOwner(uid) || isAdmin() || approvedSameGroup();
+
+      allow create: if isOwner(uid)
+        && validProfile(request.resource.data)
+        && request.resource.data.verified == false
+        && request.resource.data.get('status', 'active') == 'active'
+        && request.resource.data.get('warnings', 0) == 0
+        && request.resource.data.get('pro', false) == false
+        && request.resource.data.minor == getAfter(/databases/$(database)/documents/users/$(uid)).data.minor;
+
+      allow update: if (isOwner(uid)
+          && validProfile(request.resource.data)
+          && request.resource.data.verified == resource.data.verified                              // can't verify yourself
+          && request.resource.data.minor == resource.data.minor                                    // or switch age group
+          && request.resource.data.get('status', 'active') == resource.data.get('status', 'active') // or lift a ban
+          && request.resource.data.get('warnings', 0) == resource.data.get('warnings', 0)
+          && request.resource.data.get('pro', false) == resource.data.get('pro', false)                  // can't make yourself a pro
+          && request.resource.data.get('proCompany', '') == resource.data.get('proCompany', ''))
+        || (isAdmin() && onlyChanges(['verified', 'status', 'warnings', 'pro', 'proCompany', 'photo'])
+          && request.resource.data.get('status', 'active') in ['active', 'suspended', 'banned']);
+
+      allow delete: if isOwner(uid);
+    }
+
+    // ---------- connection requests ----------
+    match /requests/{rid} {
+      allow read: if signedIn() && (resource.data.from == me() || resource.data.to == me());
+
+      allow create: if signedIn()
+        && rid == me() + '_' + request.resource.data.to
+        && request.resource.data.keys().hasOnly(['from', 'to', 'status', 'createdAt'])
+        && request.resource.data.from == me()
+        && request.resource.data.to != me()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && canInteractWith(request.resource.data.to);
+
+      // Only the receiver answers, once.
+      allow update: if signedIn() && resource.data.to == me()
+        && resource.data.status == 'pending'
+        && onlyChanges(['status', 'respondedAt'])
+        && request.resource.data.status in ['accepted', 'declined']
+        && request.resource.data.respondedAt == request.time;
+
+      allow delete: if signedIn() && resource.data.from == me();
+    }
+
+    // ---------- chats ----------
+    match /chats/{cid} {
+      function acceptedBetween(a, b) {
+        return (existsAfter(/databases/$(database)/documents/requests/$(a + '_' + b))
+                && getAfter(/databases/$(database)/documents/requests/$(a + '_' + b)).data.status == 'accepted')
+            || (existsAfter(/databases/$(database)/documents/requests/$(b + '_' + a))
+                && getAfter(/databases/$(database)/documents/requests/$(b + '_' + a)).data.status == 'accepted');
+      }
+
+      allow read: if signedIn() && me() in resource.data.members;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['members', 'createdAt', 'lastAt', 'lastMessage', 'lastFrom'])
+        && request.resource.data.members is list
+        && request.resource.data.members.size() == 2
+        && me() in request.resource.data.members
+        && request.resource.data.members[0] < request.resource.data.members[1]
+        && cid == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastMessage == ''
+        && acceptedBetween(request.resource.data.members[0], request.resource.data.members[1]);
+
+      allow update: if signedIn() && me() in resource.data.members
+        && onlyChanges(['lastMessage', 'lastAt', 'lastFrom'])
+        && request.resource.data.lastFrom == me()
+        && request.resource.data.lastAt == request.time
+        && request.resource.data.lastMessage is string
+        && request.resource.data.lastMessage.size() <= 120;
+
+      allow delete: if false;
+
+      match /messages/{mid} {
+        function chat() { return get(/databases/$(database)/documents/chats/$(cid)).data; }
+        function otherOf(c) { return c.members[0] == me() ? c.members[1] : c.members[0]; }
+        function firstWeek(c) { return request.time < c.createdAt + duration.value(7, 'd'); }
+        function hasPhone(t) { return t.matches('(?s).*[0-9]([ .-]?[0-9]){9}.*'); }
+
+        allow read: if signedIn() && me() in chat().members;
+
+        allow create: if signedIn()
+          && me() in chat().members
+          && request.resource.data.keys().hasOnly(['from', 'text', 'at'])
+          && request.resource.data.from == me()
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 1000
+          && request.resource.data.at == request.time
+          && isActive(profileOf(me()))
+          && profileOf(me()).minor == profileOf(otherOf(chat())).minor      // never across age groups
+          && !blockedEitherWay(me(), otherOf(chat()))
+          && !(firstWeek(chat()) && hasPhone(request.resource.data.text))   // server-side backup for the AI Guard
+          && (!firstWeek(chat()) || trailOk(/databases/$(database)/documents/chats/$(cid)/trail/$(me()), request.resource.data.text));
+
+        allow update, delete: if false;
+      }
+
+      // Digit trail: the digits this person sent here in the last hour, so a number can't be sent in pieces.
+      match /trail/{uid} {
+        allow read: if signedIn() && uid == me() && me() in get(/databases/$(database)/documents/chats/$(cid)).data.members;
+        allow create, update: if signedIn() && uid == me()
+          && me() in get(/databases/$(database)/documents/chats/$(cid)).data.members
+          && trailWriteOk(/databases/$(database)/documents/chats/$(cid)/trail/$(me()));
+        allow delete: if false;
+      }
+    }
+
+    // ---------- blocks ----------
+    match /blocks/{bid} {
+      allow read: if signedIn() && (resource.data.by == me() || resource.data.target == me());
+      allow create: if signedIn()
+        && bid == me() + '_' + request.resource.data.target
+        && request.resource.data.keys().hasOnly(['by', 'target', 'at'])
+        && request.resource.data.by == me()
+        && request.resource.data.target != me()
+        && request.resource.data.at == request.time;
+      allow delete: if signedIn() && resource.data.by == me();
+    }
+
+    // ---------- reports ----------
+    match /reports/{id} {
+      allow read: if isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['by', 'byName', 'target', 'targetName', 'reason', 'note', 'excerpt', 'chatId', 'ideaId', 'auto', 'status', 'at'])
+        && request.resource.data.by == me()
+        && request.resource.data.target is string
+        && request.resource.data.reason is string && request.resource.data.reason.size() <= 80
+        && request.resource.data.note is string && request.resource.data.note.size() <= 500
+        && request.resource.data.excerpt is list && request.resource.data.excerpt.size() <= 5
+        && request.resource.data.auto is bool
+        && request.resource.data.status == 'Open'
+        && request.resource.data.at == request.time;
+      allow update: if isAdmin() && onlyChanges(['status', 'handledBy', 'handledAt']);
+      allow delete: if false;
+    }
+
+    // ---------- AI Guard events ----------
+    match /guardEvents/{id} {
+      allow read: if isAdmin();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['by', 'kind', 'chatId', 'at'])
+        && request.resource.data.by == me()
+        && request.resource.data.kind is string && request.resource.data.kind.size() <= 60
+        && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+
+    // ---------- ideas (3 levels: pitch -> summary -> plan) ----------
+    function approvedIn(minorFlag) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(me()))
+        && myAccount().parentConsent == true
+        && myAccount().minor == minorFlag;
+    }
+    function connectedWith(other) {
+      return exists(/databases/$(database)/documents/chats/$(me() < other ? me() + '_' + other : other + '_' + me()));
+    }
+    function ideaOf(id) { return get(/databases/$(database)/documents/ideas/$(id)).data; }
+    function isPro() { return signedIn() && profileOf(me()).get('pro', false) == true && myAccount().minor == false && isActive(profileOf(me())); }
+    function ndaAccepted(id) {
+      return exists(/databases/$(database)/documents/ideas/$(id)/access/$(me()))
+        && get(/databases/$(database)/documents/ideas/$(id)/access/$(me())).data.status == 'approved'
+        && get(/databases/$(database)/documents/ideas/$(id)/access/$(me())).data.ndaAt != null;
+    }
+    function validOffer(d) {
+      return d.keys().hasOnly(['name', 'company', 'kind', 'amountMin', 'amountMax', 'note', 'at'])
+        && d.kind in ['mentor', 'cobuild', 'buy']
+        && d.amountMin is int && d.amountMax is int && d.amountMin >= 0 && d.amountMax >= d.amountMin && d.amountMax <= 100000000
+        && d.note is string && d.note.size() >= 10 && d.note.size() <= 500
+        && d.at == request.time;
+    }
+
+    match /ideas/{id} {
+      allow read: if signedIn() && (resource.data.owner == me() || isAdmin()
+        || (resource.data.status == 'live' && approvedIn(resource.data.minor)));
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['owner', 'ownerName', 'ownerCollege', 'minor', 'title', 'pitch', 'tags', 'status', 'proof', 'createdAt'])
+        && request.resource.data.owner == me()
+        && myAccount().parentConsent == true
+        && request.resource.data.minor == myAccount().minor
+        && isActive(profileOf(me()))
+        && request.resource.data.status in ['live', 'review']
+        && request.resource.data.title is string && request.resource.data.title.size() >= 3 && request.resource.data.title.size() <= 80
+        && request.resource.data.pitch is string && request.resource.data.pitch.size() >= 10 && request.resource.data.pitch.size() <= 160
+        && request.resource.data.tags is list && request.resource.data.tags.size() <= 2
+        && request.resource.data.proof is string && request.resource.data.proof.size() == 64
+        && request.resource.data.createdAt == request.time;    // timestamp is set by the server and can never change
+
+      // Only admins change the status (approve / reject / take down). Nobody edits the timestamp or fingerprint.
+      allow update: if isAdmin() && onlyChanges(['status'])
+        && request.resource.data.status in ['live', 'review', 'rejected', 'removed'];
+      allow delete: if signedIn() && resource.data.owner == me();
+
+      match /interest/{uid} {
+        allow read: if signedIn() && (uid == me() || ideaOf(id).owner == me() || isAdmin());
+        allow create, update: if signedIn() && uid == me()
+          && request.resource.data.keys().hasOnly(['name', 'college', 'at'])
+          && request.resource.data.name == profileOf(me()).name
+          && request.resource.data.college is string && request.resource.data.college.size() <= 80
+          && request.resource.data.at == request.time
+          && ideaOf(id).status == 'live' && approvedIn(ideaOf(id).minor) && ideaOf(id).owner != me();
+        allow delete: if signedIn() && uid == me();
+      }
+
+      // Professionals ask for the summary; the owner allows it; the professional accepts the NDA.
+      match /access/{uid} {
+        allow read: if signedIn() && (uid == me() || ideaOf(id).owner == me() || isAdmin());
+        allow create: if uid == me() && isPro()
+          && request.resource.data.keys().hasOnly(['name', 'company', 'status', 'ndaAt', 'at'])
+          && request.resource.data.status == 'requested' && request.resource.data.ndaAt == null
+          && request.resource.data.at == request.time
+          && ideaOf(id).status == 'live' && ideaOf(id).minor == false && ideaOf(id).owner != me();
+        allow update: if signedIn() && (
+            (ideaOf(id).owner == me() && onlyChanges(['status']) && request.resource.data.status in ['approved', 'declined'])
+            || (uid == me() && resource.data.status == 'approved' && onlyChanges(['ndaAt']) && request.resource.data.ndaAt == request.time));
+        allow delete: if false;
+      }
+
+      match /offers/{uid} {
+        allow read: if signedIn() && (uid == me() || ideaOf(id).owner == me() || isAdmin());
+        allow create, update: if uid == me() && isPro() && ideaOf(id).status == 'live' && ideaOf(id).minor == false
+          && ideaOf(id).owner != me() && validOffer(request.resource.data);
+        allow delete: if signedIn() && uid == me();
+      }
+
+      match /views/{uid} {
+        allow read: if signedIn() && (ideaOf(id).owner == me() || isAdmin());
+        allow create, update: if signedIn() && uid == me()
+          && request.resource.data.keys().hasOnly(['name', 'at'])
+          && request.resource.data.name == profileOf(me()).name
+          && request.resource.data.at == request.time
+          && ideaOf(id).owner != me();
+        allow delete: if false;
+      }
+    }
+
+    match /ideaDetails/{id} {
+      allow read: if signedIn() && (resource.data.owner == me() || isAdmin()
+        || (approvedIn(resource.data.minor) && ideaOf(id).status == 'live' && connectedWith(resource.data.owner))
+        || (approvedIn(resource.data.minor) && ideaOf(id).status == 'live' && ndaAccepted(id)));
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['owner', 'minor', 'summary'])
+        && request.resource.data.owner == me()
+        && request.resource.data.minor == myAccount().minor
+        && request.resource.data.summary is string && request.resource.data.summary.size() <= 1000
+        && getAfter(/databases/$(database)/documents/ideas/$(id)).data.owner == me();
+      allow update: if signedIn() && resource.data.owner == me() && onlyChanges(['summary'])
+        && request.resource.data.summary is string && request.resource.data.summary.size() <= 1000;
+      allow delete: if signedIn() && resource.data.owner == me();
+    }
+
+    match /ideaPlans/{id} {
+      allow read: if signedIn() && (resource.data.owner == me() || isAdmin() || me() in resource.data.team);
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['owner', 'plan', 'team'])
+        && request.resource.data.owner == me()
+        && request.resource.data.plan is string && request.resource.data.plan.size() <= 3000
+        && request.resource.data.team == []
+        && getAfter(/databases/$(database)/documents/ideas/$(id)).data.owner == me();
+      allow update: if signedIn() && resource.data.owner == me() && onlyChanges(['plan', 'team'])
+        && request.resource.data.plan is string && request.resource.data.plan.size() <= 3000
+        && request.resource.data.team is list && request.resource.data.team.size() <= 10;
+      allow delete: if signedIn() && resource.data.owner == me();
+    }
+
+    // ---------- teams ----------
+    function teamOf(tid) { return get(/databases/$(database)/documents/teams/$(tid)).data; }
+    function inTeam(tid) { return signedIn() && me() in teamOf(tid).members; }
+    function invitedTo(tid) { return signedIn() && exists(/databases/$(database)/documents/teamInvites/$(tid + '_' + me())); }
+
+    match /teams/{tid} {
+      allow read: if signedIn() && (me() in resource.data.members || isAdmin() || invitedTo(tid));
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'ideaId', 'owner', 'members', 'minor', 'status', 'challenge', 'agreement', 'agreedBy', 'createdAt'])
+        && request.resource.data.owner == me()
+        && request.resource.data.members == [me()]
+        && request.resource.data.minor == myAccount().minor
+        && myAccount().parentConsent == true
+        && isActive(profileOf(me()))
+        && request.resource.data.name is string && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
+        && request.resource.data.status == 'trial'
+        && request.resource.data.agreedBy == []
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if
+        // members edit the team's own details; membership and owner stay the same
+        (signedIn() && me() in resource.data.members
+          && request.resource.data.members == resource.data.members
+          && request.resource.data.owner == resource.data.owner
+          && onlyChanges(['name', 'ideaId', 'status', 'challenge', 'agreement', 'agreedBy'])
+          && request.resource.data.status in ['trial', 'active']
+          && request.resource.data.name.size() >= 2 && request.resource.data.name.size() <= 60
+          && request.resource.data.agreedBy is list && request.resource.data.agreedBy.size() <= 6)
+        // an invited person joins (adds only themself)
+        || (invitedTo(tid)
+          && !(me() in resource.data.members)
+          && onlyChanges(['members'])
+          && request.resource.data.members == resource.data.members.concat([me()])
+          && request.resource.data.members.size() <= 6
+          && resource.data.status != 'closed')
+        // a member leaves (removes only themself; an owner who leaves hands over to someone still in the team)
+        || (signedIn() && me() in resource.data.members
+          && onlyChanges(['members', 'owner', 'agreedBy', 'status'])
+          && request.resource.data.members == resource.data.members.removeAll([me()])
+          && (request.resource.data.owner == resource.data.owner
+              || (resource.data.owner == me() && (request.resource.data.owner in request.resource.data.members || request.resource.data.members.size() == 0)))
+          && request.resource.data.status in ['trial', 'active', 'closed']);
+      allow delete: if false;
+
+      match /tasks/{task} {
+        function okAssignee(a) { return a == '' || a in teamOf(tid).members; }
+        allow read: if inTeam(tid);
+        allow create: if inTeam(tid)
+          && request.resource.data.keys().hasOnly(['title', 'assignee', 'status', 'createdBy', 'createdAt', 'doneAt'])
+          && request.resource.data.createdBy == me()
+          && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 120
+          && request.resource.data.status in ['todo', 'doing', 'done']
+          && okAssignee(request.resource.data.assignee)
+          && request.resource.data.createdAt == request.time;
+        allow update: if inTeam(tid)
+          && onlyChanges(['title', 'assignee', 'status', 'doneAt'])
+          && request.resource.data.status in ['todo', 'doing', 'done']
+          && okAssignee(request.resource.data.assignee);
+        allow delete: if inTeam(tid) && (resource.data.createdBy == me() || teamOf(tid).owner == me());
+      }
+
+      match /messages/{mid} {
+        allow read: if inTeam(tid);
+        allow create: if inTeam(tid)
+          && request.resource.data.keys().hasOnly(['from', 'text', 'at'])
+          && request.resource.data.from == me()
+          && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 1000
+          && request.resource.data.at == request.time
+          && isActive(profileOf(me()));
+        allow update, delete: if false;
+      }
+
+      match /exits/{eid} {
+        allow read: if inTeam(tid) || isAdmin();
+        allow create: if inTeam(tid)       // written in the same batch as leaving, so you're still a member here
+          && request.resource.data.keys().hasOnly(['uid', 'name', 'reason', 'note', 'at'])
+          && request.resource.data.uid == me()
+          && request.resource.data.reason is string && request.resource.data.reason.size() <= 80
+          && request.resource.data.note is string && request.resource.data.note.size() <= 300
+          && request.resource.data.at == request.time;
+        allow update, delete: if false;
+      }
+
+      // Weekly check-ins (Phase 12): one per person per week, id = "<week>_<uid>"
+      match /checkins/{cid} {
+        allow read: if inTeam(tid);
+        allow create, update: if inTeam(tid)
+          && cid == request.resource.data.week + '_' + me()
+          && request.resource.data.keys().hasOnly(['uid', 'name', 'week', 'did', 'next', 'blocker', 'mood', 'hours', 'at'])
+          && request.resource.data.uid == me()
+          && request.resource.data.week is string && request.resource.data.week.matches('^[0-9]{4}-W[0-9]{2}$')
+          && request.resource.data.name is string && request.resource.data.name.size() <= 50
+          && request.resource.data.did is string && request.resource.data.did.size() <= 300
+          && request.resource.data.next is string && request.resource.data.next.size() <= 300
+          && request.resource.data.blocker is string && request.resource.data.blocker.size() <= 300
+          && request.resource.data.mood in ['good', 'ok', 'stuck']
+          && request.resource.data.hours is int && request.resource.data.hours >= 0 && request.resource.data.hours <= 60
+          && request.resource.data.at == request.time;
+        allow delete: if false;
+      }
+
+      // Applications to this team's open roles (Phase 12): id = "<roleId>_<uid>"
+      match /applications/{aid} {
+        function roleOf(rid) { return get(/databases/$(database)/documents/roles/$(rid)).data; }
+        allow read: if inTeam(tid) || (signedIn() && resource.data.uid == me()) || isAdmin();
+        allow create, update: if signedIn()
+          && aid == request.resource.data.role + '_' + me()
+          && request.resource.data.keys().hasOnly(['uid', 'role', 'roleTitle', 'name', 'college', 'skills', 'photo', 'note', 'minor', 'status', 'at'])
+          && request.resource.data.uid == me()
+          && roleOf(request.resource.data.role).team == tid
+          && roleOf(request.resource.data.role).status == 'open'
+          && roleOf(request.resource.data.role).minor == myAccount().minor
+          && request.resource.data.minor == myAccount().minor
+          && myAccount().parentConsent == true
+          && isActive(profileOf(me()))
+          && !(me() in teamOf(tid).members)
+          && !blockedEitherWay(me(), roleOf(request.resource.data.role).postedBy)
+          && request.resource.data.name == profileOf(me()).name
+          && request.resource.data.college is string && request.resource.data.college.size() <= 80
+          && request.resource.data.skills is list && request.resource.data.skills.size() <= 4
+          && request.resource.data.photo is string && request.resource.data.photo.size() <= 300
+          && (request.resource.data.minor == false || request.resource.data.photo == '')
+          && request.resource.data.note is string && request.resource.data.note.size() <= 300
+          && request.resource.data.status == 'pending'
+          && (resource == null || resource.data.status == 'pending')   // can't re-open a decided application
+          && request.resource.data.at == request.time;
+        // the team decides
+        allow update: if inTeam(tid) && onlyChanges(['status', 'decidedAt'])
+          && request.resource.data.status in ['accepted', 'declined'];
+        allow delete: if (signedIn() && resource.data.uid == me()) || inTeam(tid);
+      }
+    }
+
+    match /teamInvites/{iid} {
+      function teamAfter() { return getAfter(/databases/$(database)/documents/teams/$(request.resource.data.team)).data; }
+      allow read: if signedIn() && (resource.data.uid == me() || resource.data.from == me());
+      allow create: if signedIn()
+        && iid == request.resource.data.team + '_' + request.resource.data.uid
+        && request.resource.data.keys().hasOnly(['team', 'teamName', 'uid', 'from', 'fromName', 'role', 'at'])
+        && request.resource.data.from == me()
+        && me() in teamAfter().members
+        && teamAfter().members.size() < 6
+        && !(request.resource.data.uid in teamAfter().members)
+        && (connectedWith(request.resource.data.uid)
+            // or they applied to one of the team's open roles and the team accepted (same batch)
+            || (request.resource.data.get('role', '') is string && request.resource.data.get('role', '') != ''
+                && getAfter(/databases/$(database)/documents/teams/$(request.resource.data.team)/applications/$(request.resource.data.role + '_' + request.resource.data.uid)).data.status == 'accepted'))
+        && !blockedEitherWay(me(), request.resource.data.uid)
+        && profileOf(request.resource.data.uid).minor == myAccount().minor
+        && request.resource.data.at == request.time;
+      allow delete: if signedIn() && (resource.data.uid == me() || resource.data.from == me());
+      allow update: if false;
+    }
+
+    // ---------- Safe Meet (adults only, public places) ----------
+    match /meets/{mid} {
+      function otherIn(m) { return m[0] == me() ? m[1] : m[0]; }
+      allow read: if signedIn() && (me() in resource.data.members || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['members', 'proposer', 'chatId', 'place', 'when', 'status', 'checkins', 'feedback', 'createdAt'])
+        && request.resource.data.proposer == me()
+        && request.resource.data.members is list && request.resource.data.members.size() == 2
+        && me() in request.resource.data.members
+        && request.resource.data.members[0] < request.resource.data.members[1]
+        && request.resource.data.chatId == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+        && exists(/databases/$(database)/documents/chats/$(request.resource.data.chatId))
+        && myAccount().minor == false
+        && profileOf(otherIn(request.resource.data.members)).minor == false
+        && isActive(profileOf(me()))
+        && !blockedEitherWay(me(), otherIn(request.resource.data.members))
+        && request.resource.data.place is string && request.resource.data.place.size() >= 3 && request.resource.data.place.size() <= 120
+        && request.resource.data.when is timestamp && request.resource.data.when > request.time
+        && request.resource.data.status == 'proposed'
+        && request.resource.data.checkins == {} && request.resource.data.feedback == {}
+        && request.resource.data.createdAt == request.time;
+      allow update: if signedIn() && me() in resource.data.members
+        && onlyChanges(['status', 'checkins', 'feedback'])
+        && request.resource.data.status in ['proposed', 'accepted', 'declined', 'cancelled', 'done']
+        // only the invited person accepts or declines
+        && (!(request.resource.data.status in ['accepted', 'declined']) || request.resource.data.status == resource.data.status || resource.data.proposer != me())
+        // you can only write your own check-in and feedback
+        && request.resource.data.checkins.diff(resource.data.checkins).affectedKeys().hasOnly([me()])
+        && request.resource.data.feedback.diff(resource.data.feedback).affectedKeys().hasOnly([me()]);
+      allow delete: if false;
+    }
+
+    // ---------- Launchpad (built products) ----------
+    function productOf(id) { return get(/databases/$(database)/documents/products/$(id)).data; }
+    function canUseProduct(id) { return productOf(id).status == 'live' && approvedIn(productOf(id).minor) && productOf(id).owner != me(); }
+
+    match /products/{pid} {
+      function validProduct(d) {
+        return d.name is string && d.name.size() >= 2 && d.name.size() <= 60
+          && d.url is string && d.url.size() <= 200 && d.url.matches('^https://[^\\s]+\\.[^\\s]+$')
+          && d.what is string && d.what.size() >= 10 && d.what.size() <= 300
+          && d.tag is string && d.tag.size() <= 40
+          && d.stage in ['prototype', 'live', 'users']
+          && d.users is int && d.users >= 0 && d.users <= 1000000
+          && d.needs is list && d.needs.size() >= 1 && d.needs.size() <= 4
+          && d.linkOk is bool;
+      }
+      allow read: if signedIn() && (resource.data.owner == me() || isAdmin()
+        || (resource.data.status == 'live' && approvedIn(resource.data.minor)));
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['owner', 'ownerName', 'ownerCollege', 'minor', 'name', 'url', 'what', 'tag', 'stage', 'users', 'needs', 'linkOk', 'status', 'createdAt'])
+        && request.resource.data.owner == me()
+        && myAccount().parentConsent == true
+        && request.resource.data.minor == myAccount().minor
+        && isActive(profileOf(me()))
+        && validProduct(request.resource.data)
+        && request.resource.data.status == 'live'
+        && request.resource.data.createdAt == request.time;
+      allow update: if (signedIn() && resource.data.owner == me()
+          && onlyChanges(['name', 'url', 'what', 'tag', 'stage', 'users', 'needs', 'linkOk'])
+          && validProduct(request.resource.data))
+        || (isAdmin() && onlyChanges(['status']) && request.resource.data.status in ['live', 'removed']);
+      allow delete: if signedIn() && resource.data.owner == me();
+
+      match /help/{uid} {
+        allow read: if signedIn() && (uid == me() || productOf(pid).owner == me() || isAdmin());
+        allow create, update: if signedIn() && uid == me() && canUseProduct(pid)
+          && request.resource.data.keys().hasOnly(['name', 'college', 'need', 'note', 'at'])
+          && request.resource.data.need in ['growth', 'guidance', 'testers', 'takeover']
+          && request.resource.data.note is string && request.resource.data.note.size() <= 300
+          && request.resource.data.at == request.time;
+        allow delete: if signedIn() && uid == me();
+      }
+
+      match /feedback/{uid} {
+        allow read: if signedIn() && (uid == me() || productOf(pid).owner == me() || isAdmin());
+        allow create, update: if signedIn() && uid == me() && canUseProduct(pid)
+          && request.resource.data.keys().hasOnly(['name', 'score', 'comment', 'at'])
+          && request.resource.data.score is int && request.resource.data.score >= 1 && request.resource.data.score <= 5
+          && request.resource.data.comment is string && request.resource.data.comment.size() <= 500
+          && request.resource.data.at == request.time;
+        allow delete: if signedIn() && uid == me();
+      }
+
+      match /offers/{uid} {
+        allow read: if signedIn() && (uid == me() || productOf(pid).owner == me() || isAdmin());
+        allow create, update: if uid == me() && isPro() && canUseProduct(pid) && productOf(pid).minor == false
+          && validOffer(request.resource.data);
+        allow delete: if signedIn() && uid == me();
+      }
+    }
+
+    // ---------- professional verification ----------
+    match /proRequests/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create, update: if (isOwner(uid) && myAccount().minor == false
+          && request.resource.data.keys().hasOnly(['name', 'company', 'role', 'linkedin', 'workEmail', 'note', 'status', 'at'])
+          && request.resource.data.status == 'pending'
+          && request.resource.data.company is string && request.resource.data.company.size() >= 2 && request.resource.data.company.size() <= 80
+          && request.resource.data.role is string && request.resource.data.role.size() <= 80
+          && request.resource.data.linkedin is string && request.resource.data.linkedin.size() <= 200
+          && (request.resource.data.linkedin == '' || request.resource.data.linkedin.matches('^https://[^\\s]+$'))
+          && looksLikeEmail(request.resource.data.workEmail)
+          && request.resource.data.note is string && request.resource.data.note.size() <= 300
+          && request.resource.data.at == request.time
+          && (resource == null || resource.data.status != 'pending'))
+        || (isAdmin() && resource != null && onlyChanges(['status']) && request.resource.data.status in ['approved', 'rejected']);
+      allow delete: if false;
+    }
+
+    // ---------- pilot evaluation ----------
+    match /ratings/{rid} {
+      allow read: if isAdmin() || (signedIn() && resource.data.by == me());
+      allow create, update: if signedIn()
+        && rid == me() + '_' + request.resource.data.target
+        && request.resource.data.keys().hasOnly(['by', 'target', 'score', 'matchScore', 'vision', 'skills', 'style', 'distance', 'visionSource', 'at'])
+        && request.resource.data.by == me()
+        && request.resource.data.score is int && request.resource.data.score >= 1 && request.resource.data.score <= 5
+        && request.resource.data.matchScore is number && request.resource.data.matchScore >= 0 && request.resource.data.matchScore <= 100
+        && request.resource.data.visionSource in ['ai', 'keywords']
+        && request.resource.data.at == request.time;
+      allow delete: if false;
+    }
+
+    match /feedback/{uid} {
+      function score(v) { return v is int && v >= 1 && v <= 5; }
+      allow read: if isAdmin() || isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['easy', 'useful', 'safe', 'recommend', 'comment', 'at'])
+        && score(request.resource.data.easy) && score(request.resource.data.useful)
+        && score(request.resource.data.safe) && score(request.resource.data.recommend)
+        && request.resource.data.comment is string && request.resource.data.comment.size() <= 500
+        && request.resource.data.at == request.time;
+      allow delete: if false;
+    }
+
+    // ---------- admin ----------
+    // ---------- college ID verification (Phase 11) ----------
+    // The photo itself never touches Firestore: it is stored privately on Cloudinary by the server and deleted after the decision.
+    match /idRequests/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if false; // only the server (Admin SDK) writes here
+    }
+
+    // ---------- push notification devices (Phase 11) ----------
+    match /pushTokens/{uid} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['tokens', 'updatedAt'])
+        && request.resource.data.tokens is list && request.resource.data.tokens.size() <= 5
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    // ---------- hackathons and events (Phase 11) ----------
+    match /events/{id} {
+      function validEvent(d) {
+        return d.keys().hasOnly(['title', 'organizer', 'kind', 'mode', 'place', 'link', 'about', 'startAt', 'endAt',
+                                 'audience', 'teamSize', 'status', 'createdBy', 'createdByName', 'createdAt'])
+          && d.title is string && d.title.size() >= 4 && d.title.size() <= 100
+          && d.organizer is string && d.organizer.size() >= 2 && d.organizer.size() <= 80
+          && d.kind in ['Hackathon', 'Workshop', 'Competition', 'Meetup', 'Fest']
+          && d.mode in ['In person', 'Online']
+          && d.place is string && d.place.size() <= 120
+          && d.link is string && (d.link == '' || d.link.matches('^https://[^\\s]{3,290}$'))
+          && d.about is string && d.about.size() <= 1500
+          && d.startAt is timestamp && d.endAt is timestamp && d.endAt >= d.startAt
+          && d.audience in ['all', 'adults']
+          && d.teamSize is int && d.teamSize >= 1 && d.teamSize <= 10
+          && d.status in ['pending', 'live']
+          && d.createdByName is string && d.createdByName.size() <= 50;
+      }
+      function approvedMe() { return signedIn() && myAccount().parentConsent == true; }
+
+      // Live events for everyone allowed to see them (18+ only events are hidden from Safe Mode); your own suggestions; admins see all.
+      allow read: if approvedMe() && (
+        (resource.data.status == 'live' && (resource.data.audience == 'all' || myAccount().minor == false))
+        || resource.data.createdBy == me() || isAdmin());
+
+      // Admins publish directly. Active adult students can suggest one; an admin reviews it first.
+      allow create: if approvedMe() && validEvent(request.resource.data)
+        && request.resource.data.createdBy == me() && request.resource.data.createdAt == request.time
+        && (isAdmin() || (request.resource.data.status == 'pending' && myAccount().minor == false && isActive(profileOf(me()))));
+      allow update: if isAdmin() && validEvent(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isAdmin() || (signedIn() && resource.data.createdBy == me() && resource.data.status == 'pending');
+
+      // Who is going / looking for a team. Visible only inside your own age group.
+      match /people/{uid} {
+        allow read: if approvedMe() && resource.data.minor == myAccount().minor;
+        allow create, update: if isOwner(uid) && approvedMe() && isActive(profileOf(me()))
+          && get(/databases/$(database)/documents/events/$(id)).data.status == 'live'
+          && request.resource.data.keys().hasOnly(['name', 'college', 'skills', 'photo', 'note', 'team', 'minor', 'at'])
+          && request.resource.data.minor == myAccount().minor
+          && request.resource.data.name == profileOf(me()).name
+          && request.resource.data.college is string && request.resource.data.college.size() <= 80
+          && request.resource.data.skills is list && request.resource.data.skills.size() <= 4
+          && request.resource.data.photo is string && request.resource.data.photo.size() <= 300
+          && (request.resource.data.minor == false || request.resource.data.photo == '')
+          && request.resource.data.note is string && request.resource.data.note.size() <= 200
+          && request.resource.data.team is bool
+          && request.resource.data.at == request.time;
+        allow delete: if isOwner(uid) || isAdmin();
+      }
+    }
+
+    // ---------- Open roles in teams (Phase 12) ----------
+    match /roles/{rid} {
+      function validRole(d) {
+        return d.keys().hasOnly(['team', 'teamName', 'ideaId', 'title', 'skill', 'hours', 'about', 'minor', 'status',
+                                 'postedBy', 'postedByName', 'college', 'area', 'createdAt'])
+          && d.title is string && d.title.size() >= 3 && d.title.size() <= 50
+          && d.teamName is string && d.teamName.size() <= 60
+          && d.ideaId is string && d.ideaId.size() <= 40
+          && d.skill is string && d.skill.size() <= 40
+          && d.hours is string && d.hours.size() <= 40
+          && d.about is string && d.about.size() <= 400
+          && d.status in ['open', 'filled', 'closed']
+          && d.postedByName is string && d.postedByName.size() <= 50
+          && d.college is string && d.college.size() <= 80
+          && d.area is string && d.area.size() <= 60;
+      }
+      allow read: if signedIn() && myAccount().parentConsent == true && resource.data.minor == myAccount().minor;
+      allow create: if inTeam(request.resource.data.team) && validRole(request.resource.data)
+        && request.resource.data.minor == teamOf(request.resource.data.team).minor
+        && request.resource.data.postedBy == me() && request.resource.data.status == 'open'
+        && isActive(profileOf(me())) && request.resource.data.createdAt == request.time;
+      allow update: if inTeam(resource.data.team) && validRole(request.resource.data)
+        && onlyChanges(['title', 'skill', 'hours', 'about', 'status', 'teamName']);
+      allow delete: if inTeam(resource.data.team) || isAdmin();
+    }
+
+    // ---------- Learning circles (Phase 12) ----------
+    function circleOf(cid) { return get(/databases/$(database)/documents/circles/$(cid)).data; }
+    function inCircle(cid) { return signedIn() && me() in circleOf(cid).members; }
+    match /circles/{cid} {
+      function validCircle(d) {
+        return d.keys().hasOnly(['title', 'topic', 'level', 'about', 'schedule', 'mode', 'place', 'maxSize', 'weeks',
+                                 'members', 'owner', 'ownerName', 'minor', 'college', 'status', 'createdAt'])
+          && d.title is string && d.title.size() >= 4 && d.title.size() <= 80
+          && d.topic is string && d.topic.size() <= 40
+          && d.level is string && d.level.size() <= 40
+          && d.about is string && d.about.size() <= 600
+          && d.schedule is string && d.schedule.size() >= 3 && d.schedule.size() <= 80
+          && d.mode in ['Online', 'At college', 'In person']
+          && (d.minor == false || d.mode != 'In person')          // Safe Mode: online or at school/college only
+          && d.place is string && d.place.size() <= 100
+          && d.maxSize is int && d.maxSize >= 3 && d.maxSize <= 8
+          && d.weeks is int && d.weeks >= 1 && d.weeks <= 12
+          && d.members is list && d.members.size() <= d.maxSize
+          && d.ownerName is string && d.ownerName.size() <= 50
+          && d.college is string && d.college.size() <= 80
+          && d.status in ['open', 'ended'];
+      }
+      function approvedMe() { return signedIn() && myAccount().parentConsent == true; }
+      allow read: if approvedMe() && resource.data.minor == myAccount().minor;
+      allow create: if approvedMe() && isActive(profileOf(me())) && validCircle(request.resource.data)
+        && request.resource.data.owner == me() && request.resource.data.members == [me()]
+        && request.resource.data.minor == myAccount().minor && request.resource.data.status == 'open'
+        && request.resource.data.createdAt == request.time;
+      allow update: if
+        // the person who started it edits details; members stay the same
+        (signedIn() && resource.data.owner == me() && validCircle(request.resource.data)
+          && onlyChanges(['title', 'topic', 'level', 'about', 'schedule', 'mode', 'place', 'maxSize', 'weeks', 'status']))
+        // join: add only yourself, while open and not full
+        || (approvedMe() && isActive(profileOf(me())) && !(me() in resource.data.members)
+          && resource.data.minor == myAccount().minor && resource.data.status == 'open'
+          && onlyChanges(['members'])
+          && request.resource.data.members == resource.data.members.concat([me()])
+          && request.resource.data.members.size() <= resource.data.maxSize
+          && !blockedEitherWay(me(), resource.data.owner))
+        // leave: remove only yourself; the starter hands over to someone still inside
+        || (signedIn() && me() in resource.data.members
+          && onlyChanges(['members', 'owner', 'ownerName'])
+          && request.resource.data.members == resource.data.members.removeAll([me()])
+          && (request.resource.data.owner == resource.data.owner
+              || (resource.data.owner == me() && request.resource.data.owner in request.resource.data.members)));
+      allow delete: if isAdmin() || (signedIn() && resource.data.owner == me() && resource.data.members.size() <= 1);
+
+      match /sessions/{sid} {
+        allow read: if inCircle(cid) || isAdmin();   // holds call links, so members only
+        allow create: if inCircle(cid)
+          && request.resource.data.keys().hasOnly(['week', 'title', 'notes', 'link', 'attended', 'createdBy', 'at'])
+          && request.resource.data.week is int && request.resource.data.week >= 1 && request.resource.data.week <= 12
+          && request.resource.data.title is string && request.resource.data.title.size() >= 1 && request.resource.data.title.size() <= 100
+          && request.resource.data.notes is string && request.resource.data.notes.size() <= 500
+          && request.resource.data.link is string && request.resource.data.link.size() <= 300
+          && (request.resource.data.link == '' || request.resource.data.link.matches('^https://[^\\s]{3,290}$'))
+          && request.resource.data.attended == []
+          && request.resource.data.createdBy == me() && request.resource.data.at == request.time;
+        // members tick or untick only themselves
+        allow update: if inCircle(cid) && onlyChanges(['attended'])
+          && (request.resource.data.attended == resource.data.attended.concat([me()]) && !(me() in resource.data.attended)
+              || request.resource.data.attended == resource.data.attended.removeAll([me()]));
+        allow delete: if inCircle(cid) && (resource.data.createdBy == me() || circleOf(cid).owner == me());
+      }
+
+      match /messages/{mid} {
+        allow read: if inCircle(cid);
+        allow create: if inCircle(cid)
+          && request.resource.data.keys().hasOnly(['from', 'text', 'at'])
+          && request.resource.data.from == me()
+          && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 1000
+          && !request.resource.data.text.matches('(?s).*[0-9]([ .-]?[0-9]){9}.*')   // no phone numbers in circles
+          && trailOk(/databases/$(database)/documents/circles/$(cid)/trail/$(me()), request.resource.data.text)   // not in pieces either
+          && request.resource.data.at == request.time
+          && isActive(profileOf(me()));
+        allow update, delete: if false;
+      }
+
+      match /trail/{uid} {
+        allow read: if inCircle(cid) && uid == me();
+        allow create, update: if inCircle(cid) && uid == me()
+          && trailWriteOk(/databases/$(database)/documents/circles/$(cid)/trail/$(me()));
+        allow delete: if false;
+      }
+    }
+
+    // ---------- Project showcase (Phase 12): id = team id ----------
+    match /showcase/{tid} {
+      function validShowcase(d) {
+        return d.keys().hasOnly(['team', 'teamName', 'title', 'tagline', 'problem', 'built', 'link', 'repo', 'stack',
+                                 'memberIds', 'members', 'minor', 'status', 'publishedAt', 'updatedAt'])
+          && d.team == tid
+          && d.title is string && d.title.size() >= 2 && d.title.size() <= 80
+          && d.tagline is string && d.tagline.size() >= 10 && d.tagline.size() <= 140
+          && d.problem is string && d.problem.size() <= 600
+          && d.built is string && d.built.size() >= 20 && d.built.size() <= 1200
+          && d.link is string && (d.link == '' || d.link.matches('^https://[^\\s]{3,290}$'))
+          && d.repo is string && (d.repo == '' || d.repo.matches('^https://[^\\s]{3,290}$'))
+          && d.stack is list && d.stack.size() <= 8
+          && d.memberIds is list && d.memberIds.size() >= 1 && d.memberIds.size() <= 6
+          && teamOf(tid).members.hasAll(d.memberIds)
+          && d.members is map && d.members.size() <= 6
+          && d.minor == teamOf(tid).minor
+          && d.status in ['live', 'hidden']
+          && d.updatedAt == request.time;
+      }
+      // Adults' live projects are public (anyone with the link, for resumes). Safe Mode projects: same age group only.
+      allow read: if (resource.data.status == 'live' && resource.data.minor == false)
+        || (signedIn() && (isAdmin() || inTeam(tid)
+            || (resource.data.status == 'live' && myAccount().parentConsent == true && resource.data.minor == myAccount().minor)));
+      allow create, update: if inTeam(tid) && teamOf(tid).status == 'active' && validShowcase(request.resource.data)
+        && (resource == null || request.resource.data.publishedAt == resource.data.publishedAt);
+      allow update: if isAdmin() && onlyChanges(['status', 'updatedAt']);
+      allow delete: if inTeam(tid) || isAdmin();
+    }
+
+    // ---------- Mentor office hours (Phase 13): always a group, 18+ only ----------
+    function sessionOf(id) { return get(/databases/$(database)/documents/officeHours/$(id)).data; }
+    function adultApproved() { return signedIn() && myAccount().parentConsent == true && myAccount().minor == false; }
+    match /officeHours/{id} {
+      function validSession(d) {
+        return d.keys().hasOnly(['host', 'hostName', 'hostCompany', 'topic', 'about', 'startAt', 'duration', 'capacity', 'attendees', 'status', 'createdAt'])
+          && d.hostName is string && d.hostName.size() <= 50
+          && d.hostCompany is string && d.hostCompany.size() <= 80
+          && d.topic is string && d.topic.size() >= 5 && d.topic.size() <= 100
+          && d.about is string && d.about.size() <= 800
+          && d.startAt is timestamp
+          && d.duration in [30, 45, 60]
+          && d.capacity is int && d.capacity >= 3 && d.capacity <= 20
+          && d.attendees is list && d.attendees.size() <= d.capacity
+          && d.status in ['open', 'cancelled'];
+      }
+      allow read: if adultApproved();
+      allow create: if adultApproved() && (profileOf(me()).get('pro', false) == true || isAdmin())
+        && validSession(request.resource.data) && request.resource.data.host == me()
+        && request.resource.data.attendees == [] && request.resource.data.status == 'open'
+        && request.resource.data.startAt > request.time && request.resource.data.createdAt == request.time;
+      allow update: if
+        (signedIn() && resource.data.host == me() && validSession(request.resource.data)
+          && onlyChanges(['topic', 'about', 'startAt', 'duration', 'capacity', 'status']))
+        || (adultApproved() && isActive(profileOf(me())) && resource.data.status == 'open' && resource.data.host != me()
+          && onlyChanges(['attendees'])
+          && ((request.resource.data.attendees == resource.data.attendees.concat([me()]) && !(me() in resource.data.attendees)
+               && request.resource.data.attendees.size() <= resource.data.capacity && !blockedEitherWay(me(), resource.data.host))
+              || request.resource.data.attendees == resource.data.attendees.removeAll([me()])))
+        || (isAdmin() && onlyChanges(['status']));
+      allow delete: if isAdmin();
+
+      match /private/{doc} {   // the call link: host + booked students only
+        allow read: if signedIn() && (sessionOf(id).host == me() || me() in sessionOf(id).attendees || isAdmin());
+        allow create: if signedIn() && doc == 'join'
+          && getAfter(/databases/$(database)/documents/officeHours/$(id)).data.host == me()
+          && request.resource.data.keys().hasOnly(['link'])
+          && request.resource.data.link is string && request.resource.data.link.matches('^https://[^\\s]{8,290}$');
+        allow update: if signedIn() && sessionOf(id).host == me()
+          && request.resource.data.keys().hasOnly(['link'])
+          && request.resource.data.link.matches('^https://[^\\s]{8,290}$');
+        allow delete: if false;
+      }
+
+      match /questions/{qid} {
+        allow read: if signedIn() && (sessionOf(id).host == me() || me() in sessionOf(id).attendees || isAdmin());
+        allow create: if signedIn() && (sessionOf(id).host == me() || me() in sessionOf(id).attendees)
+          && request.resource.data.keys().hasOnly(['from', 'name', 'text', 'at'])
+          && request.resource.data.from == me()
+          && request.resource.data.name == profileOf(me()).name
+          && request.resource.data.text is string && request.resource.data.text.size() >= 1 && request.resource.data.text.size() <= 300
+          && !request.resource.data.text.matches('(?s).*[0-9]([ .-]?[0-9]){9}.*')
+          && request.resource.data.at == request.time;
+        allow delete: if signedIn() && (resource.data.from == me() || sessionOf(id).host == me() || isAdmin());
+        allow update: if false;
+      }
+    }
+
+    // ---------- Personal settings (Phase 13): weekly email choice. Owner only; the server reads it ----------
+    match /settings/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['digest', 'updatedAt', 'lastDigestAt'])
+        && request.resource.data.digest is bool
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isOwner(uid);
+    }
+
+    // ---------- Resume builder (Phase 14): private to the owner ----------
+    match /resumes/{uid} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['template', 'headline', 'summary', 'email', 'phone', 'location', 'links', 'education',
+                                                 'experience', 'extraProjects', 'hiddenProjects', 'extraSkills', 'achievements', 'languages', 'show', 'updatedAt'])
+        && request.resource.data.template in ['classic', 'modern']
+        && request.resource.data.headline is string && request.resource.data.headline.size() <= 100
+        && request.resource.data.summary is string && request.resource.data.summary.size() <= 500
+        && request.resource.data.email is string && request.resource.data.email.size() <= 100
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 20
+        && request.resource.data.location is string && request.resource.data.location.size() <= 60
+        && request.resource.data.links is map
+        && request.resource.data.education is list && request.resource.data.education.size() <= 6
+        && request.resource.data.experience is list && request.resource.data.experience.size() <= 6
+        && request.resource.data.extraProjects is list && request.resource.data.extraProjects.size() <= 6
+        && request.resource.data.hiddenProjects is list && request.resource.data.hiddenProjects.size() <= 20
+        && request.resource.data.extraSkills is string && request.resource.data.extraSkills.size() <= 300
+        && request.resource.data.achievements is string && request.resource.data.achievements.size() <= 800
+        && request.resource.data.languages is string && request.resource.data.languages.size() <= 100
+        && request.resource.data.show is map
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    match /admins/{uid} {
+      allow read: if isOwner(uid);
+      allow write: if false;
+    }
+
+    // ---------- Exact location (safety): only the student and admins can read it ----------
+    match /locations/{uid} {
+      allow read: if signedIn() && (uid == me() || isAdmin());
+      allow create, update: if signedIn() && uid == me()
+        && request.resource.data.keys().hasOnly(['lat', 'lng', 'accuracy', 'at'])
+        && request.resource.data.lat is number && request.resource.data.lat >= -90 && request.resource.data.lat <= 90
+        && request.resource.data.lng is number && request.resource.data.lng >= -180 && request.resource.data.lng <= 180
+        && request.resource.data.accuracy is number && request.resource.data.accuracy >= 0 && request.resource.data.accuracy <= 100000
+        && request.resource.data.at == request.time;
+      // only together with deleting the account (the profile is already gone)
+      allow delete: if signedIn() && uid == me() && !exists(/databases/$(database)/documents/profiles/$(uid));
+    }
+
+    match /adminLog/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.by == me() && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+  }
+}

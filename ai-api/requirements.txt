@@ -1,0 +1,14 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32
+pydantic>=2.10
+numpy>=2.1
+scikit-learn>=1.5.2
+joblib>=1.4
+sentence-transformers>=3.3
+google-auth>=2.36
+requests>=2.32
+python-dotenv>=1.0
+firebase-admin>=6.5
+cloudinary>=1.41
+python-multipart>=0.0.12
+transformers>=4.40

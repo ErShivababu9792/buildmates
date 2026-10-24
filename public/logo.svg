@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 64">
+  <title>BuildMates</title>
+  <rect width="64" height="64" rx="16" fill="#0E6B57"/>
+  <rect x="28" y="13" width="23" height="19" rx="4.5" fill="#E3A21A"/>
+  <rect x="13" y="32" width="23" height="19" rx="4.5" fill="#FFFFFF"/>
+  <text x="80" y="43" font-family="Bricolage Grotesque, Plus Jakarta Sans, Arial, sans-serif" font-size="32" font-weight="700" fill="#14211D" letter-spacing="-0.6">Build<tspan fill="#0E6B57">Mates</tspan></text>
+</svg>

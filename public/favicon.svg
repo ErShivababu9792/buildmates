@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>BuildMates</title>
+  <rect width="64" height="64" rx="16" fill="#0E6B57"/>
+  <rect x="28" y="13" width="23" height="19" rx="4.5" fill="#E3A21A"/>
+  <rect x="13" y="32" width="23" height="19" rx="4.5" fill="#FFFFFF"/>
+</svg>
