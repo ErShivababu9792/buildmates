@@ -190,6 +190,10 @@ def health():
 
 @app.post("/embed")
 def embed_route(body: TextIn, uid: str = Depends(rate_limited)):
+    # Small free servers (512 MB, e.g. Render) run without the AI model: EMBED_MODEL=off.
+    # The app then matches by keywords, everything else keeps working.
+    if EMBED_MODEL == "off":
+        raise HTTPException(status_code=503, detail="AI matching is off on this server. Keyword matching is used.")
     return {"vector": embed(body.text.strip()), "dims": 384}
 
 
