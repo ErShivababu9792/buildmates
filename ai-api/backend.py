@@ -42,8 +42,18 @@ def admin_app():
     if _admin["app"] is not None:
         return _admin["app"]
     raw = os.getenv("FIREBASE_SERVICE_ACCOUNT", "").strip()
+    # Render "Secret Files": upload serviceAccount.json there and nothing else is needed
+    if not raw or (not raw.startswith("{") and not os.path.exists(raw if os.path.isabs(raw) else os.path.join(HERE, raw))):
+        for p in ("/etc/secrets/serviceAccount.json", os.path.join(HERE, "serviceAccount.json")):
+            if os.path.exists(p):
+                raw = p
+                break
+    # tolerate the value being wrapped in quotes when pasted
+    if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "'\"" and raw[1:2] == "{":
+        raw = raw[1:-1]
     if not raw:
         _admin["error"] = "FIREBASE_SERVICE_ACCOUNT is not set"
+        print("[firebase] admin key missing: set FIREBASE_SERVICE_ACCOUNT or add the secret file serviceAccount.json")
         return None
     try:
         import firebase_admin
@@ -59,6 +69,10 @@ def admin_app():
         _admin["error"] = ""
     except Exception as e:  # wrong path, broken JSON …
         _admin["error"] = f"Service account could not be loaded: {type(e).__name__}"
+        # Shown in the server log (Render → Logs). Never prints the key itself.
+        hint = "the value is not the full JSON file ({ ... })" if isinstance(e, (json.JSONDecodeError, ValueError)) else str(e)[:120]
+        print(f"[firebase] admin key could not be loaded: {type(e).__name__}: {hint}. "
+              f"Starts with {raw[:1]!r}, ends with {raw[-1:]!r}, length {len(raw)}")
         return None
     return _admin["app"]
 
